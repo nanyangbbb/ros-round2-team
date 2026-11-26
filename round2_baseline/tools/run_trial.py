@@ -23,6 +23,7 @@ p.add_argument('output')
 p.add_argument('--seconds',type=int,default=600)
 p.add_argument('--cones',action='store_true')
 p.add_argument('--gui',action='store_true',help='Show Gazebo for manual-start performance regression checks')
+p.add_argument('--no-audio-playback', action='store_true', help='Synthesize the vision announcement without playing it on a sound device')
 p.add_argument('--profile-performance',action='store_true',help='Record host thread load and simulation clock')
 p.add_argument('--stationary-profile-urdf', type=Path,
                help='Profile a separate URDF at the stationary hybrid spawn, without issuing motion commands')
@@ -139,11 +140,11 @@ if args.hybrid_qr_blocks and (not args.cones or not args.gui or not args.contact
                              args.debug_bends_only or args.debug_prefix_until or args.build_fixed_map or
                              args.map_file or args.debug_control or args.startup_only):
     p.error('The hybrid trial uses its own route, GUI, random cones and independent contact observer')
-if args.hybrid_full and (not args.gui or not args.cones or not args.contact_observer or args.map_file or
+if args.hybrid_full and (not args.cones or not args.contact_observer or args.map_file or
                          args.fixed_qr_trial or args.qr_blocks_trial or args.hybrid_qr_blocks or
                          args.debug_pose or args.debug_prefix_until or args.debug_from_stage or
                          args.debug_bends_only or args.startup_only or args.build_fixed_map):
-    p.error('The full hybrid trial requires the complete odom route, GUI, cones and a contact observer')
+    p.error('The full hybrid trial requires the complete odom route, cones and a contact observer')
 if (args.offline_cone_layout or args.hybrid_qr_only or args.fast_qr) and not args.hybrid_qr_blocks:
     p.error('Offline layout, QR-only and fast QR options require --hybrid-qr-blocks')
 if args.hybrid_qr_blocks:
@@ -294,6 +295,8 @@ try:
     control_args.append('align_return:='+str(args.align_return).lower())
     control_args.append('attitude_protection:='+str(args.attitude_protection).lower())
     control_args.append('vision_evidence_root:='+str(out/'vision'))
+    if args.no_audio_playback:
+        control_args.append('play_audio:=false')
     if args.hybrid_full:
         control_args.extend(['hybrid_full:=true', 'hybrid_optimize:='+str(not args.no_hybrid_optimize).lower(), 'hybrid_evidence:='+str(out/'hybrid.json')])
         result.update(scope='FULL HYBRID ROUTE', navigation_mode='hybrid_astar_through_finish')
@@ -371,7 +374,10 @@ try:
             if time.monotonic()>ready_deadline:raise RuntimeError('Preflight not ready')
     time.sleep(2)
     env=dict(os.environ)
-    if args.seed is not None:env['CONE_SEED']=str(args.seed)
+    if args.seed is None:
+        env.pop('CONE_SEED', None)
+    else:
+        env['CONE_SEED'] = str(args.seed)
     scripts=[] if args.build_fixed_map else ['random_place.py']
     if args.cones:scripts.insert(0,'random_cones.py')
     for script in scripts:
@@ -423,7 +429,7 @@ try:
                 covariance=list(msg.pose.covariance)))
         rospy.Subscriber('/localized_odom',Odometry,localized_pose,queue_size=10)
     launch(['python3',str(Path(__file__).with_name('capture.py')),str(out/'snapshots'),str(args.seconds),'--clock',args.timeout_clock],'capture')
-    if args.hybrid_qr_blocks or args.hybrid_full:
+    if args.gui and (args.hybrid_qr_blocks or args.hybrid_full):
         wait_for_gazebo_window()
         print('Gazebo GUI opened. Reviewing stationary spawn before motion.', flush=True)
         time.sleep(args.gui_start_hold)
@@ -547,8 +553,9 @@ try:
                     result['forward_distance_m'] = sum(math.hypot(a['x'] - b['x'], a['y'] - b['y'])
                                                        for a, b in zip(forward, forward[1:]))
                     result['peak_forward_speed_mps'] = max((pose['v'][0] for pose in forward), default=0.)
-        print('Gazebo GUI remains open briefly for stop inspection.', flush=True)
-        time.sleep(8)
+        if args.gui:
+            print('Gazebo GUI remains open briefly for stop inspection.', flush=True)
+            time.sleep(8)
     if args.hybrid_full:
         result['vision'] = [json.loads(path.read_text())
                             for path in sorted((out/'vision').glob('*/result.json'))]

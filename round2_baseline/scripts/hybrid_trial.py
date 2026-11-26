@@ -18,7 +18,7 @@ from bend_path import PreparedPath, rounded_path
 from cone_obstacles import detect
 from finish_region import contained
 from fixed_qr import QR_BOX
-from hybrid_path import (BLUE_EXIT_CONE, CANDIDATES, GATE, SPAWN, FootprintMap, center, fixed_walls,
+from hybrid_path import (BLOCK_STOP_RADIUS, BLOCK_WALL_MARGIN, BLUE_EXIT_CONE, CANDIDATES, GATE, SPAWN, FootprintMap, center, fixed_walls,
                          connector, docking_path, heading_error, hybrid_astar, legal_layouts, NoPath, qr_reference,
                          qr_pocket_exit, viewpoint_score)
 from motion_geometry import yaw_from_orientation
@@ -530,34 +530,36 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
             raise RuntimeError('Cone observations conflict with all legal layouts')
         return last_candidates
 
-    def plan(pose, remaining, *, explore=False):
+    def plan(pose, remaining, *, explore=False, stop=cancelled):
         occupied = frozenset().union(*remaining)
         cone_margin = BLOCK_CONE_MARGIN if optimize and not explore else None
-        obstacle_map = FootprintMap(walls, footprint, occupied, cone_margin=cone_margin)
+        wall_margin = BLOCK_WALL_MARGIN if optimize and not explore else .014
+        obstacle_map = FootprintMap(walls, footprint, occupied, margin=wall_margin, cone_margin=cone_margin)
         began = time.monotonic()
         score = viewpoint_score(walls, remaining, visited) if explore else None
         limit = 1400 if explore else 36000 if len(remaining) == 1 else 2800
         # The camera must still be able to look toward the production tables.
         headings = [goal[2] + offset for offset in (0., -.35, .35, -.70, .70)] if optimize and not explore else None
         try:
-            path, expanded = hybrid_astar(pose, goal, obstacle_map, cancelled, limit=limit,
+            path, expanded = hybrid_astar(pose, goal, obstacle_map, stop, limit=limit,
                                           viewpoint=score, goal_headings=headings)
         except NoPath:
             if explore and optimize:
-                path, expanded = hybrid_astar(pose, goal, obstacle_map, cancelled, limit=12000,
+                path, expanded = hybrid_astar(pose, goal, obstacle_map, stop, limit=12000,
                                               viewpoint=score, viewpoint_horizon=2.5)
             elif cone_margin is not None and len(remaining) == 1:
-                cone_margin = None
-                obstacle_map = FootprintMap(walls, footprint, occupied)
-                path, expanded = hybrid_astar(pose, goal, obstacle_map, cancelled, limit=limit,
+                cone_margin = .014
+                obstacle_map = FootprintMap(walls, footprint, occupied, margin=wall_margin, cone_margin=cone_margin)
+                path, expanded = hybrid_astar(pose, goal, obstacle_map, stop, limit=limit,
                                               goal_headings=headings)
             else:
                 raise
         if optimize:
             path = optimize_trajectory(path, obstacle_map,
-                                       OBSERVATION_LIMITS if explore else HYBRID_LIMITS, cancelled)
+                                       OBSERVATION_LIMITS if explore else HYBRID_LIMITS, stop)
         return dict(wall_s=time.monotonic() - began, expanded=expanded, path=path,
-                    remaining_layouts=len(remaining), occupied_union=sorted(occupied), cone_margin=cone_margin)
+                    remaining_layouts=len(remaining), occupied_union=sorted(occupied),
+                    wall_margin=wall_margin, cone_margin=cone_margin)
 
     def runtime_map(plan):
         return FootprintMap(walls, footprint, plan['occupied_union'], margin=0.)
@@ -584,7 +586,6 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
 
     # The camera compensates from the measured chassis yaw once parked.
     block_yaw_tolerance = math.pi if free_parking else .10
-    block_stop_radius = .075 if free_parking else .025
 
     def announce(plan, start_speed=0.):
         nonlocal arm_prechecked
@@ -601,8 +602,14 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
         reference = PreparedPath(path, *HYBRID_LIMITS, start_speed=min(.90, start_speed),
                                  terminal_heading_distance=.10 if terminal_alignment and not free_parking else 0.,
                                  lookahead_time=.22 if free_parking else 0.,
-                                 parking_tolerance=block_stop_radius if free_parking else None)
+                                 parking_tolerance=BLOCK_STOP_RADIUS if free_parking else None)
         return reference
+
+    def drive_to_blocks(reference, checked, local_velocity=False):
+        control.follow_bends([['blocks', *reference.path[-1]]], deadline, prepared=reference, check_braking=False,
+                             position_tolerance=BLOCK_STOP_RADIUS, yaw_tolerance=block_yaw_tolerance,
+                             collision_map=checked, align_at_stop=terminal_alignment, local_geometry=local_geometry,
+                             local_velocity=local_velocity, avoidance_active=approach_avoidance_active)
 
     for _ in range(5):
         initial = candidates()
@@ -614,11 +621,7 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
                 raise
         else:
             reference = announce(direct)
-            control.follow_bends([['blocks', *reference.path[-1]]], deadline, prepared=reference, check_braking=False,
-                                 position_tolerance=block_stop_radius, yaw_tolerance=block_yaw_tolerance,
-                                 collision_map=runtime_map(direct),
-                                 align_at_stop=terminal_alignment, local_geometry=local_geometry,
-                                 avoidance_active=approach_avoidance_active)
+            drive_to_blocks(reference, runtime_map(direct))
             return
 
         exploration = plan(actual_pose(control), initial, explore=True)
@@ -633,13 +636,18 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
         reference = PreparedPath(exploration['path'], *(OBSERVATION_LIMITS if optimize else (.30, .65, 1.4)))
         attempts = exploration['replans'] = []
         control.report('EXPLORING', f'{len(initial)} compatible layouts')
+        stop_workers = threading.Event()
+
+        def background_plan(pose, remaining):
+            return plan(pose, remaining, stop=lambda: stop_workers.is_set() or cancelled())
 
         def join_candidate(candidate, remaining, *, preplanned=False):
             nonlocal selected
             current = actual_pose(control)
             path = candidate['path']
             occupied = frozenset().union(*remaining)
-            checked = FootprintMap(walls, footprint, occupied)
+            checked = FootprintMap(walls, footprint, occupied, margin=candidate['wall_margin'],
+                                   cone_margin=candidate['cone_margin'])
             # Re-anchor a tangent-matched connector at the live odometry pose.
             for index in range(0, min(len(path) - 1, 30), 2):
                 for curve in connector(current, path[index], 5.8):
@@ -651,6 +659,7 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
                     speed = max(0., control.odom.twist.twist.linear.x)
                     joined_reference = announce(joined, speed)
                     selected = True
+                    stop_workers.set()
                     control.report('MOVING', 'blocks')
                     return ('blocks', *joined_reference.path[-1], joined_reference,
                             runtime_map(joined), block_yaw_tolerance)
@@ -662,7 +671,7 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
         checked_layouts = None
         compatible_paths = []
         with ThreadPoolExecutor(max_workers=2 if optimize else 1) as worker:
-            def update():
+            def update(at_viewpoint=False):
                 nonlocal future, tried, found_route, retried
                 nonlocal speculative, checked_layouts, compatible_paths
                 current_layouts = candidates()
@@ -674,20 +683,21 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
                     checked_layouts = None
                 if optimize and checked_layouts != current_layouts:
                     occupied = frozenset().union(*current_layouts)
-                    checked = FootprintMap(walls, footprint, occupied)
                     compatible_paths = [path for layout, path in cached.items()
-                                        if layout in current_layouts and checked.sweep_clear(path['path'])]
+                                        if layout in current_layouts and
+                                        FootprintMap(walls, footprint, occupied, margin=path['wall_margin'],
+                                                     cone_margin=path['cone_margin']).sweep_clear(path['path'])]
                     checked_layouts = current_layouts
                 for candidate in compatible_paths:
                     selection = join_candidate(candidate, current_layouts, preplanned=True)
                     if selection is not None:
                         return selection
-                if optimize and speculative is None and 1 < len(current_layouts) <= 8:
+                if not at_viewpoint and optimize and speculative is None and 1 < len(current_layouts) <= 8:
                     for layout in current_layouts:
                         if layout in attempted:
                             continue
                         attempted.add(layout)
-                        speculative = worker.submit(preplan_observation_exit, plan, end, layout)
+                        speculative = worker.submit(preplan_observation_exit, background_plan, end, layout)
                         break
                 if future is not None and future.done():
                     try:
@@ -710,24 +720,38 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
                     anchor = min(len(reference.path) - 1, bisect_left(reference.arc, reference.arc[index] + .085))
                     retried = False
                     found_route = False
-                    future = worker.submit(plan, reference.path[anchor], tried)
+                    future = worker.submit(background_plan, current if at_viewpoint else reference.path[anchor], tried)
                 elif future is None and found_route and not retried:
                     retried = True
-                    future = worker.submit(plan, actual_pose(control), tried)
+                    future = worker.submit(background_plan, actual_pose(control), tried)
                 return None
 
-            control.follow_bends([['cone_viewpoint', *end]], deadline,
-                                 prepared=reference,
-                                 check_braking=False, position_tolerance=.025, yaw_tolerance=.32,
-                                 select_path=update, collision_map=runtime_map(exploration),
-                                 align_at_stop=terminal_alignment, local_geometry=local_geometry,
-                                 local_velocity=optimize, avoidance_active=approach_avoidance_active)
-        if selected:
+            try:
+                control.follow_bends([['cone_viewpoint', *end]], deadline,
+                                     prepared=reference,
+                                     check_braking=False, position_tolerance=.025, yaw_tolerance=.32,
+                                     select_path=update, collision_map=runtime_map(exploration),
+                                     align_at_stop=terminal_alignment, local_geometry=local_geometry,
+                                     local_velocity=optimize, avoidance_active=approach_avoidance_active)
+                if selected:
+                    return
+                visited.append(actual_pose(control))
+                began = rospy.get_time()
+                until = time.monotonic() + 1.2
+                while True:
+                    if cancelled():
+                        raise RuntimeError('Block route cancelled at the observation point')
+                    selection = update(at_viewpoint=True)
+                    if selection is not None:
+                        break
+                    if future is None and (len(tried) == 1 or found_route or time.monotonic() >= until):
+                        break
+                    time.sleep(.02)
+                exploration['wait_sim_s'] = rospy.get_time() - began
+            finally:
+                stop_workers.set()
+        if selection is not None:
+            _, _, _, _, block_reference, checked, _ = selection
+            drive_to_blocks(block_reference, checked, local_velocity=optimize)
             return
-        visited.append(actual_pose(control))
-        began = rospy.get_time()
-        until = time.monotonic() + 1.2
-        while not found_route and candidates() == tried and not cancelled() and time.monotonic() < until:
-            time.sleep(.02)
-        exploration['wait_sim_s'] = rospy.get_time() - began
     raise RuntimeError('No common block route after five checked observation segments')

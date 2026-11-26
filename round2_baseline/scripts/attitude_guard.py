@@ -69,6 +69,10 @@ class Guard:
                             self.yaw_feedback.maximum if self.yaw_feedback else None)
 
     def route_limits(self,state,bend_settings,whole_route=False):
+        # The chassis is still following the block approach during these notifications.
+        if whole_route and (state.get('state'), state.get('detail')) in (
+                ('ENTERED', 'block_area'), ('ARM_PREPARE', 'blocks')):
+            return
         active=state.get('state') in ('MOVING','PASSED') and (whole_route or state.get('detail','').startswith('bend'))
         active = active or (whole_route and state.get('state') == 'TURNING' and state.get('detail') == 'finish')
         if bend_settings and active:
@@ -335,6 +339,12 @@ def self_test():
         assert (scoped.max_speed,scoped.linear_accel,scoped.yaw_feedback.maximum)==(.55,.65,.65)
     scoped.route_limits(dict(state='MOVING',detail='bend1'),{})
     assert scoped.max_speed==.55
+    scoped.route_limits(dict(state='MOVING',detail='blocks'),limits,whole_route=True)
+    for event, detail in [('ENTERED','block_area'),('ARM_PREPARE','blocks')]:
+        scoped.route_limits(dict(state=event,detail=detail),limits,whole_route=True)
+        assert (scoped.max_speed,scoped.linear_accel,scoped.yaw_feedback.maximum)==(.9,1.3,2.1)
+    scoped.route_limits(dict(state='ARRIVED',detail='blocks'),limits,whole_route=True)
+    assert (scoped.max_speed,scoped.linear_accel,scoped.yaw_feedback.maximum)==(.55,.65,.65)
     print('PASS: bend bounds only activate with opt-in settings and restore on exit/failure')
     print('PASS: startup, new-command release, slew and clamp, stale data, frozen clock, duplicate odometry, scan gate, latched fault, bounded yaw feedback and stop reset')
 

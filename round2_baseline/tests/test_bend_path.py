@@ -1,7 +1,35 @@
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import yaml
-from bend_path import advance_bend_passages,bend_passage_lines,rounded_path,path_command,braking_clear,validate_settings
+from bend_path import PreparedPath,advance_bend_passages,bend_passage_lines,rounded_path,path_command,braking_clear,validate_settings
+
+
+def check_parking_with_guard_limits():
+    reference = [(i * .015, 0., 0.) for i in range(101)]
+    tolerance = .025
+    tracker = PreparedPath(reference, .90, 1.25, 2.2, start_speed=.90,
+                           lookahead_time=.22, parking_tolerance=tolerance)
+    x, speed, output, progress = .40, .89, .89, 0
+    dt = .034  # Odom period observed in the seed-31 block approach.
+    for _ in range(300):
+        velocity = SimpleNamespace(linear=SimpleNamespace(x=speed, y=0.),
+                                   angular=SimpleNamespace(z=0.))
+        if tracker.ready_to_park(x, 0., 0., velocity):
+            # Include one final command interval before the stable guard decelerates.
+            stopped_x = x + dt * speed + speed**2 / (2 * .50)
+            assert abs(stopped_x - reference[-1][0]) <= tolerance
+            return
+        requested, _, progress = tracker.command(progress, x, 0., 0., speed)
+        acceleration = 1.60 if x < 1.0 else .50
+        delta = max(-acceleration * dt, min(acceleration * dt, output - speed))
+        x += (speed + .5 * delta) * dt
+        speed += delta
+        output = requested
+    raise AssertionError('Vehicle did not reach the block parking tolerance')
+
+
+check_parking_with_guard_limits()
 
 route=yaml.safe_load((Path(__file__).parents[1]/'config/route.yaml').read_text())[:9]
 points=[(-.75,1.75)]+[(x,2.72 if name in ('bend1','bend2') else y) for name,x,y,_ in route]

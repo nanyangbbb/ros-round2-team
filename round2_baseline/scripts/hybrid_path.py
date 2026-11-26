@@ -8,6 +8,8 @@ from bend_path import rounded_path
 
 
 SPAWN = (.75, 1.25, math.pi)
+BLOCK_STOP_RADIUS = .025
+BLOCK_WALL_MARGIN = .040
 GATE = (5, 2)
 BLUE_EXIT_CONE = (4, 2)
 FREE_CELL = (5, 1)

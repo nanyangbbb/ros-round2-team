@@ -135,8 +135,9 @@ class PreparedPath:
         self.terminal_heading_distance=terminal_heading_distance
         self.lookahead_time = lookahead_time
         self.parking_tolerance = parking_tolerance
-        self.parking_deceleration = .60
-        self.parking_latency = .06
+        # Plan for the stable guard's available braking and odometry/command latency.
+        self.parking_deceleration = .50
+        self.parking_latency = .10
         self.steps=[math.dist(a[:2],b[:2]) for a,b in zip(path,path[1:])]
         if min(self.steps)<=1e-9:raise ValueError('Repeated prepared path positions')
         self.arc=[0.]
@@ -188,9 +189,10 @@ class PreparedPath:
             else:speed=min(speed,2.5*distance(path[-1]))
         if self.parking_tolerance is not None:
             # Solve d = v * latency + v² / (2 * deceleration) for speed.
-            # This limit becomes active only near the stop and uses measured chassis braking.
+            # Aim inside the acceptance radius with room for braking variation.
+            braking_distance = max(0., remaining - .5 * self.parking_tolerance)
             latency_term = self.parking_deceleration * self.parking_latency
-            parking_speed = math.sqrt(latency_term**2 + 2 * self.parking_deceleration * remaining)
+            parking_speed = math.sqrt(latency_term**2 + 2 * self.parking_deceleration * braking_distance)
             speed = min(speed, parking_speed - latency_term)
         speed=min(speed,self.max_yaw_rate/max(abs(curvature),1e-9),math.sqrt(self.acceleration/max(abs(curvature),1e-9)))
         omega = speed * curvature
