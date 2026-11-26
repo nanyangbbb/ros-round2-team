@@ -3,11 +3,16 @@
   <arg name="timeout_clock" default="wall"/>
   <arg name="manual_supervision" default="false"/>
   <arg name="flow_costmap_resolution" default="0.01"/>
+  <arg name="hybrid_full" default="false"/>
+  <arg name="hybrid_optimize" default="true"/>
+  <arg name="hybrid_evidence" default=""/>
+  <arg name="fixed_qr_trial" default="false"/>
   <arg name="efficient_approach" default="false"/>
   <arg name="map_file" default=""/>
   <arg name="attitude_protection" default="false"/>
   <arg name="vision" default="true"/>
   <arg name="qr_preposition" default="true"/>
+  <arg name="block_preposition" default="false"/>
   <arg name="align_return" default="true"/>
   <arg name="play_audio" default="true"/>
   <arg name="vision_audio_device" default="plughw:1,0"/>
@@ -25,10 +30,10 @@
     </node>
     <node pkg="round2_baseline" type="localized_odometry.py" name="localized_odometry" output="screen" required="true"/>
   </group>
-  <node pkg="round2_baseline" type="cone_obstacles.py" name="cone_obstacles" output="screen">
+  <node unless="$(arg fixed_qr_trial)" pkg="round2_baseline" type="cone_obstacles.py" name="cone_obstacles" output="screen">
     <param name="navigation_frame" value="$(eval 'map' if arg('map_file') else 'odom')"/>
   </node>
-  <node pkg="move_base" type="move_base" name="move_base" output="screen" clear_params="true">
+  <node unless="$(arg fixed_qr_trial)" pkg="move_base" type="move_base" name="move_base" output="screen" clear_params="true">
     <remap from="cmd_vel" to="nav_cmd_vel"/>
     <rosparam file="$(find round2_baseline)/config/navigation.yaml"/>
     <rosparam if="$(eval arg('speed_profile') == 'fast')" file="$(find round2_baseline)/config/speed_fast.yaml"/>
@@ -49,12 +54,18 @@
     <param name="angular_feedback" value="true"/>
   </node>
   <node pkg="round2_baseline" type="control.py" name="round2_control" output="screen">
+    <param name="fixed_qr_trial" value="$(arg fixed_qr_trial)"/>
+    <rosparam if="$(arg fixed_qr_trial)" ns="parking_geometry" file="$(find round2_baseline)/config/navigation.yaml"/>
     <param name="manual_supervision" value="$(arg manual_supervision)"/>
     <param name="navigation_frame" value="$(eval 'map' if arg('map_file') else 'odom')"/>
     <param name="pose_topic" value="$(eval '/localized_odom' if arg('map_file') else '/odom')"/>
     <param name="vision" value="$(arg vision)"/>
     <param name="qr_preposition" value="$(arg qr_preposition)"/>
     <rosparam param="flow_settings" file="$(find round2_baseline)/config/route_flow.yaml"/>
+    <param name="hybrid_optimize" value="$(arg hybrid_optimize)"/>
+    <param name="flow_settings/hybrid_full" value="$(eval arg('hybrid_full') and arg('map_file') == '')"/>
+    <param name="hybrid_evidence" type="str" value="$(arg hybrid_evidence)"/>
+    <param name="flow_settings/block_preposition" value="$(arg block_preposition)"/>
     <param name="flow_settings/align_return" value="$(arg align_return)"/>
     <rosparam param="bend_settings" file="$(find round2_baseline)/config/bend_tracking.yaml"/>
     <param name="efficient_approach" value="$(arg efficient_approach)"/>

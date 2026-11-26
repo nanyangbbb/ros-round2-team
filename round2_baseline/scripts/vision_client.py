@@ -18,12 +18,17 @@ def vision_client():
             raise RuntimeError('Image recognition server unavailable')
         _vision_client = client
     return _vision_client
-def image_task(control,stage,expected='',timeout=None):
-    """阻塞等待图像任务完成：有超时、可被取消、必须等到结果才继续。"""
+def start_image_task(stage,expected='',timeout=None):
     timeout = float(timeout or rospy.get_param('~image_timeout',40.0))
     client = vision_client()
-    control.report('IMAGE_WAIT',stage)
     client.send_goal(RecognizeTaskGoal(stage=stage,expected=expected or '',timeout=timeout))
+    return client, timeout
+
+
+def finish_image_task(control,stage,task):
+    """Wait for recognition and playback, with cancellation and a watchdog."""
+    control.report('IMAGE_WAIT',stage)
+    client, timeout = task
     deadline = time.monotonic() + timeout + 2
     terminal = (GoalStatus.PREEMPTED, GoalStatus.SUCCEEDED, GoalStatus.ABORTED,
                 GoalStatus.REJECTED, GoalStatus.RECALLED, GoalStatus.LOST)
@@ -42,3 +47,7 @@ def image_task(control,stage,expected='',timeout=None):
     control.report('RECOGNIZED','%s=%s' % (stage,result.task_label))
     rospy.loginfo('vision %s -> %s | %s',stage,result.task_label,result.utterance)
     return result
+
+
+def image_task(control,stage,expected='',timeout=None):
+    return finish_image_task(control,stage,start_image_task(stage,expected,timeout))

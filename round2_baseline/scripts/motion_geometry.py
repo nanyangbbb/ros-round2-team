@@ -15,18 +15,22 @@ def footprint_clear(grid, x, y, yaw, polygon, padding):
         px+=math.copysign(padding,px);py+=math.copysign(padding,py)
         vertices.append((x+c*px-s*py,y+s*px+c*py))
     margin=r/math.sqrt(2)
-    ix0=math.floor((min(p[0] for p in vertices)-margin-ox)/r)
-    ix1=math.floor((max(p[0] for p in vertices)+margin-ox)/r)
-    iy0=math.floor((min(p[1] for p in vertices)-margin-oy)/r)
-    iy1=math.floor((max(p[1] for p in vertices)+margin-oy)/r)
+    xs, ys = zip(*vertices)
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    ix0=math.floor((xmin-margin-ox)/r)
+    ix1=math.floor((xmax+margin-ox)/r)
+    iy0=math.floor((ymin-margin-oy)/r)
+    iy1=math.floor((ymax+margin-oy)/r)
     if ix0<0 or iy0<0 or ix1>=grid.info.width or iy1>=grid.info.height:return False
     edges=list(zip(vertices,vertices[1:]+vertices[:1]))
-    xmin,xmax=min(p[0] for p in vertices),max(p[0] for p in vertices)
-    ymin,ymax=min(p[1] for p in vertices),max(p[1] for p in vertices)
     half=r/2
     for iy in range(iy0,iy1+1):
-        for ix in range(ix0,ix1+1):
-            value=grid.data[iy*grid.info.width+ix]
+        offset = iy * grid.info.width
+        row = grid.data[offset + ix0 : offset + ix1 + 1]
+        if min(row) >= 0 and max(row) < 100:
+            continue
+        for ix, value in enumerate(row, ix0):
             if 0<=value<100:continue
             px,py=ox+(ix+.5)*r,oy+(iy+.5)*r
             if px+half<xmin or px-half>xmax or py+half<ymin or py-half>ymax:continue

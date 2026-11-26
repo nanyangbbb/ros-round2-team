@@ -70,6 +70,7 @@ class Guard:
 
     def route_limits(self,state,bend_settings,whole_route=False):
         active=state.get('state') in ('MOVING','PASSED') and (whole_route or state.get('detail','').startswith('bend'))
+        active = active or (whole_route and state.get('state') == 'TURNING' and state.get('detail') == 'finish')
         if bend_settings and active:
             values=[bend_settings[k] for k in ('output_speed','output_acceleration','output_yaw_rate')]
             if not all(math.isfinite(v) and v>0 for v in values):raise ValueError('Invalid bend output limits')

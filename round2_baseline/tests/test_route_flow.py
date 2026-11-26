@@ -20,6 +20,11 @@ assert not m.via_reached(['qr_approach',-.25,.25,0.],-.25,1.25)
 assert not m.via_reached(['qr_approach',-.25,.25,0.],-.5,.25)
 assert m.via_reached(['return',-.7,1.2,0.],-.6,1.1)
 assert not m.via_reached(['return',-.7,1.2,0.],-1.75,2.25)
+assert m.block_arm_clear(pose(-1.66,2.216,2.124),-1.75)
+assert m.via_reached(['cone_exit',-1.75,2.20,1.57],-1.75,2.11)
+assert not m.block_arm_clear(pose(-1.75,2.11,math.pi/2),-1.75)
+assert not m.block_arm_clear(pose(-1.75,2.2,-math.pi/2),-1.75)
+assert not m.block_arm_clear(pose(-1.75,2.50,math.pi/2),-1.75)
 curve=m.entry_curve((-.44,.25),(-.25,.45,1.57),0.)
 assert curve[0][:2]==[-.44,.25] and curve[-1][:2]==[-.25,.45]
 assert abs(curve[0][2])<1e-9 and abs(curve[-1][2]-1.57)<1e-9
@@ -57,3 +62,17 @@ assert calls[8][0]=='turn'
 assert calls[9][1]==['return','finish_approach'] and not calls[9][2]['announce']
 assert cfg['navigation']['max_vel_y']==0.
 print('PASS: forward-only staging curve; QR precision; reverse departure; cone/blocks share goal; return passes; image-task boundaries retained')
+
+# The full hybrid flow owns both image tasks and the finish.
+import hybrid_trial
+
+full_route = yaml.safe_load((Path(__file__).parents[1]/'config/route.yaml').read_text())
+calls.clear()
+with patch.object(m.rospy, 'get_param', return_value=dict(cfg, hybrid_full=True)), \
+     patch.object(hybrid_trial, 'run_full_hybrid',
+                  side_effect=lambda c, r, d: calls.append(('hybrid', [v[0] for v in r]))), \
+     patch.object(m, 'navigate',
+                  side_effect=lambda c, p, r, d, s, **kw: calls.append(('navigate', [v[0] for v in r], kw))):
+    m.run_flow(c, None, full_route, 100.)
+assert calls == [('hybrid', [point[0] for point in full_route])]
+print('PASS: full hybrid route owns every waypoint through the finish')

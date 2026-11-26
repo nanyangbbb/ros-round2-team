@@ -12,6 +12,8 @@
   - 识别结果、原图、音频全部落盘，供裁判核验。
 """
 import json
+import itertools
+import math
 import os
 import subprocess
 import tempfile
@@ -61,12 +63,16 @@ class VisionServer(object):
         self.evidence_root = rospy.get_param("~evidence_root", os.path.expanduser("~/vision_evidence"))
         self.min_score = float(rospy.get_param("~min_block_score", 0.50))
         self.min_margin = float(rospy.get_param("~min_block_margin", 0.09))
+        self.block_early_reject = rospy.get_param("~block_early_reject", True)
         self.poses = {
             "qr": rospy.get_param("~qr_poses"),
             "block": rospy.get_param("~block_poses"),
         }
+        self.block_targets = rospy.get_param("~block_targets", [])
         self.stow_pose = rospy.get_param("~stow_pose")
         self.joint_state = None
+        self.block_prepared_at = None
+        self.qr_parked_at = float('-inf')
 
         self.arm_pub = rospy.Publisher(self.arm_topic, String, queue_size=1)
         self.status_pub = rospy.Publisher("~status", String, queue_size=10, latch=True)
@@ -79,7 +85,8 @@ class VisionServer(object):
         self.server = SimpleActionServer("~recognize", RecognizeTaskAction,
                                          execute_cb=self._execute, auto_start=False)
         self.server.start()
-        rospy.Subscriber("~prepare_qr", Empty, self._prepare_qr, queue_size=1)
+        rospy.Subscriber("~qr_parked", Empty, self._qr_parked, queue_size=1)
+        rospy.Subscriber("~prepare_block", Empty, self._prepare_block, queue_size=1)
         self._status({"state": "READY", "templates": sorted(self.templates)})
         rospy.loginfo("round2_vision 就绪, 模板=%s", sorted(self.templates))
 
@@ -121,11 +128,24 @@ class VisionServer(object):
         if time.monotonic() >= deadline:
             raise RuntimeError("视觉任务超时")
 
-    def _prepare_qr(self, _):
-        # The first QR pose stays within the navigation footprint during travel.
-        if not self.server.is_active() and self.arm_pub.get_num_connections():
-            self.arm_pub.publish(String(data=json.dumps(self.poses["qr"][0])))
-            rospy.loginfo("QR camera preposition requested")
+    def _qr_parked(self, _):
+        with self.lock:
+            self.qr_parked_at = time.monotonic()
+
+    def _wait_for_qr_park(self, started):
+        while True:
+            self._check_active(float('inf'))
+            with self.lock:
+                if self.qr_parked_at >= started:
+                    return self.qr_parked_at
+            time.sleep(0.01)
+
+    def _prepare_block(self, _):
+        with self.lock:
+            if not self.server.is_active() and self.arm_pub.get_num_connections():
+                self.block_prepared_at = rospy.Time.now()
+                self.arm_pub.publish(String(data=json.dumps(self.poses["block"][0])))
+                rospy.loginfo("First block camera pose sent during the approach")
 
     def _command_arm(self, angles, deadline):
         self._check_active(deadline)
@@ -155,20 +175,27 @@ class VisionServer(object):
                     return state.header.stamp
             time.sleep(0.02)
 
+    def _frames_at_pose(self, angles, deadline, count, sent=None, not_before=None):
+        if sent is None:
+            sent = self._command_arm(angles, deadline)
+        after = self._wait_for_arm(angles, sent, deadline)
+        if not_before is not None:
+            after = max(after, not_before)
+        for _ in itertools.count() if count is None else range(count):
+            while True:
+                self._check_active(deadline)
+                with self.lock:
+                    msg = self.latest
+                if msg is not None and msg.header.stamp > after:
+                    break
+                time.sleep(0.02)
+            after = msg.header.stamp
+            yield self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
     def _capture(self, stage, deadline, count):
         for pose_index, angles in enumerate(self.poses[stage]):
-            sent = self._command_arm(angles, deadline)
-            after = self._wait_for_arm(angles, sent, deadline)
-            for frame_index in range(count):
-                while True:
-                    self._check_active(deadline)
-                    with self.lock:
-                        msg = self.latest
-                    if msg is not None and msg.header.stamp > after:
-                        break
-                    time.sleep(0.02)
-                after = msg.header.stamp
-                yield pose_index, frame_index, self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            for index, frame in enumerate(self._frames_at_pose(angles, deadline, count)):
+                yield pose_index, index, frame
 
     # ---------- 二维码 ----------
     @staticmethod
@@ -278,6 +305,65 @@ class VisionServer(object):
             cv2.imwrite(os.path.join(evidence_dir, "block_%s_face%02d.png" % (tag, index)), patch)
             yield {"frame": tag, "candidate": index, "scores": scores}
 
+    def _check_block_frame(self, frame, tag, expected, evidence_dir, evidence, deadline):
+        """Return a target match or whether confident candidates agree on a different class."""
+        other_labels = set()
+        for candidate in self._classify_block(frame, evidence_dir, tag):
+            self._check_active(deadline)
+            print(json.dumps(candidate), file=evidence, flush=True)
+            scores = candidate["scores"]
+            score, key = scores[0]
+            if score >= self.min_score and score - scores[1][0] >= self.min_margin:
+                if LABELS[key] == expected:
+                    return candidate, False
+                other_labels.add(key)
+        return None, len(other_labels) == 1
+
+    def _block_views(self, vehicle_pose):
+        if vehicle_pose is None or len(self.block_targets) != len(self.poses["block"]):
+            return self.poses["block"]
+        x, y, heading = vehicle_pose
+        # The yaw joint is 56.624 mm forward of base_footprint in the robot model.
+        pivot_x = x + .056624 * math.cos(heading)
+        pivot_y = y + .056624 * math.sin(heading)
+        views = []
+        for index, ((target_x, target_y), angles) in enumerate(zip(self.block_targets, self.poses["block"])):
+            error = math.atan2(target_y - pivot_y, target_x - pivot_x) - heading
+            yaw = math.atan2(math.sin(error), math.cos(error))
+            views.append((index, [max(-3.14, min(3.14, yaw)), *angles[1:]]))
+        if len(views) < 2:
+            return [angles for _, angles in views]
+        # Start at the closer edge, then traverse the other views by joint travel.
+        first = min((view for view in views if view[0] != 0), key=lambda view: abs(view[1][0]))
+        remaining = sorted((view for view in views if view is not first),
+                           key=lambda view: abs(view[1][0] - first[1][0]))
+        return [angles for _, angles in (first, *remaining)]
+
+    def _recognize_block(self, expected, evidence_dir, deadline, stopped_at, prepared_at, views):
+        matches = []
+        started = time.monotonic()
+        first_frame_wait = None
+        with open(os.path.join(evidence_dir, "block_matches.jsonl"), "w") as evidence:
+            for pose, angles in enumerate(views):
+                pose_hits = 0
+                frames = self._frames_at_pose(angles, deadline, count=2,
+                                              sent=prepared_at if pose == 0 else None,
+                                              not_before=stopped_at)
+                for index, frame in enumerate(frames):
+                    if first_frame_wait is None:
+                        first_frame_wait = time.monotonic() - started
+                    tag = "%02d_%02d" % (pose, index)
+                    match, other_class = self._check_block_frame(
+                        frame, tag, expected, evidence_dir, evidence, deadline)
+                    if match is not None:
+                        matches.append(match)
+                        pose_hits += 1
+                        if pose_hits == 2:
+                            return matches, first_frame_wait
+                    elif self.block_early_reject and index == 0 and other_class:
+                        break
+        raise RuntimeError("未能连续确认与二维码对应的物块：%s" % expected)
+
     def _run_audio(self, command, deadline):
         with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as process:
             try:
@@ -296,10 +382,13 @@ class VisionServer(object):
                     process.kill()
                     process.communicate()
 
-    def _speak(self, text, evidence_dir, deadline):
+    def _synthesize(self, text, evidence_dir, deadline):
         wav = os.path.join(evidence_dir, "broadcast.wav")
         self._run_audio(["espeak-ng", "-v", self.voice, "-s", str(self.voice_rate),
                          "-w", wav, text], deadline)
+        return wav
+
+    def _play(self, wav, deadline):
         if self.play_audio:
             device = ["-D", self.audio_device] if self.audio_device else []
             self._run_audio(["aplay", "-q"] + device + [wav], deadline)
@@ -308,28 +397,41 @@ class VisionServer(object):
     # ---------- action 主循环 ----------
     def _execute(self, goal):
         started = time.monotonic()
-        deadline = started + (goal.timeout if goal.timeout > 0 else 40.0)
+        task_stamp = rospy.Time.now()
+        with self.lock:
+            prepared_at = self.block_prepared_at
+            self.block_prepared_at = None
+        timeout = goal.timeout if goal.timeout > 0 else 40.0
+        deadline = started + timeout
         stamp = time.strftime("%Y%m%d_%H%M%S")
         os.makedirs(self.evidence_root, exist_ok=True)
-        stage = goal.stage if goal.stage in self.poses else "task"
+        early_qr = goal.stage == "qr_approach"
+        stage = "qr" if early_qr else goal.stage if goal.stage in self.poses else "task"
         evidence_dir = tempfile.mkdtemp(prefix="%s_%s_" % (stage, stamp), dir=self.evidence_root)
         result = RecognizeTaskResult(success=False, evidence_dir=evidence_dir)
         feedback = RecognizeTaskFeedback()
+        timing = {}
 
         def tick(text):
             feedback.progress = text
             self.server.publish_feedback(feedback)
-            self._status({"state": "RUNNING", "stage": goal.stage, "progress": text})
+            self._status({"state": "RUNNING", "stage": stage, "progress": text})
 
         try:
-            if goal.stage == "qr":
+            if stage == "qr":
                 tick("capture_qr")
-                for pose, index, frame in self._capture("qr", deadline, count=2):
+                if early_qr:
+                    frames = ((0,index,frame) for index,frame in enumerate(
+                        self._frames_at_pose(self.poses["qr"][0],deadline,count=None)))
+                else:
+                    frames = self._capture("qr",deadline,count=2)
+                for pose, index, frame in frames:
                     cv2.imwrite(os.path.join(evidence_dir, "qr_%02d_%02d.png" % (pose, index)), frame)
                     text, info = self._decode_variants(frame)
                     label = LABELS.get(text.strip()) if text else None
                     if label:
                         info["pose"] = pose
+                        timing["qr_decoded_wall"] = time.monotonic()
                         break
                 else:
                     raise RuntimeError("未解出赛事二维码")
@@ -346,59 +448,66 @@ class VisionServer(object):
                     raise RuntimeError("物块任务缺少有效的二维码类别")
                 if len(self.templates) != len(TEMPLATE_FILES):
                     raise RuntimeError("物块分类模板不完整")
-                matches = {}
-                with open(os.path.join(evidence_dir, "block_matches.jsonl"), "w") as evidence:
-                    for pose, index, frame in self._capture("block", deadline, count=2):
-                        tag = "%02d_%02d" % (pose, index)
-                        for candidate in self._classify_block(frame, evidence_dir, tag):
-                            self._check_active(deadline)
-                            scores = candidate["scores"]
-                            score, key = scores[0]
-                            margin = score - scores[1][0]
-                            print(json.dumps(candidate), file=evidence, flush=True)
-                            if score >= self.min_score and margin >= self.min_margin and LABELS[key] == expected:
-                                matches[tag] = candidate
-                                break
-                        if sum(tag.startswith("%02d_" % pose) for tag in matches) >= 2:
-                            break
-                    else:
-                        raise RuntimeError("未能连续确认与二维码对应的物块：%s" % expected)
+                lead = (task_stamp - prepared_at).to_sec() if prepared_at is not None else None
+                if lead is not None and not 0 <= lead <= 4.0:
+                    prepared_at, lead = None, None
+                views = self._block_views(rospy.get_param("~block_vehicle_pose", None))
+                if views[0] != self.poses["block"][0]:
+                    prepared_at, lead = None, None
+                matches, first_frame_wait = self._recognize_block(
+                    expected, evidence_dir, deadline, task_stamp, prepared_at, views)
+                timing = {"block_preposition_lead_sim": lead,
+                          "block_scan_yaws_rad": [angles[0] for angles in views],
+                          "first_block_frame_wait_wall": round(first_frame_wait, 3)}
                 label = expected
-                result.detail = json.dumps(list(matches.values()), ensure_ascii=False)
+                result.detail = json.dumps(matches, ensure_ascii=False)
                 result.task_label = label
                 result.utterance = "取得%s，现在前往对应生产车间。" % label
                 result.success = True
             else:
                 raise RuntimeError("未知 stage: %r" % (goal.stage,))
 
-            tick("broadcast")
             sent = self._command_arm(self.stow_pose, deadline)
-            audio = self._speak(result.utterance, evidence_dir, deadline)
-            self._wait_for_arm(self.stow_pose, sent, deadline)
+            wav = self._synthesize(result.utterance,evidence_dir,deadline)
+            if early_qr:
+                timing["qr_parked_wall"] = self._wait_for_qr_park(started)
+                deadline = time.monotonic() + timeout
+            tick("broadcast")
+            if early_qr:
+                timing["qr_audio_start_wall"] = time.monotonic()
+            audio = self._play(wav,deadline)
+            if early_qr:
+                timing["qr_audio_end_wall"] = time.monotonic()
+            elif stage != "block" or not rospy.get_param("~block_depart_during_stow", False):
+                self._wait_for_arm(self.stow_pose,sent,deadline)
+            if stage == "block":
+                timing["block_stow_sent_sim"] = sent.to_sec()
+                timing["block_result_sim"] = rospy.Time.now().to_sec()
             with open(os.path.join(evidence_dir, "result.json"), "w") as fh:
-                json.dump({"stage": goal.stage, "expected": goal.expected,
+                json.dump({"stage": stage, "expected": goal.expected,
                            "success": result.success, "task_label": result.task_label,
                            "utterance": result.utterance, "detail": result.detail,
                            "audio": audio,
-                           "elapsed": round(time.monotonic() - started, 3)},
+                           "elapsed": round(time.monotonic() - started, 3),
+                           **timing},
                           fh, ensure_ascii=False, indent=2)
             self.server.set_succeeded(result)
-            self._status({"state": "DONE", "stage": goal.stage,
+            self._status({"state": "DONE", "stage": stage,
                           "label": result.task_label, "utterance": result.utterance})
 
         except Exception as exc:                       # noqa: BLE001
             result.success = False
             result.detail = (result.detail + " | " if result.detail else "") + repr(exc)
             with open(os.path.join(evidence_dir, "result.json"), "w") as fh:
-                json.dump({"stage": goal.stage, "expected": goal.expected, "success": False,
+                json.dump({"stage": stage, "expected": goal.expected, "success": False,
                            "detail": result.detail, "elapsed": round(time.monotonic() - started, 3)},
                           fh, ensure_ascii=False, indent=2)
             if self.server.is_preempt_requested():
                 self.server.set_preempted(result)
-                self._status({"state": "PREEMPTED", "stage": goal.stage})
+                self._status({"state": "PREEMPTED", "stage": stage})
             else:
                 self.server.set_aborted(result)
-                self._status({"state": "FAILED", "stage": goal.stage, "detail": result.detail})
+                self._status({"state": "FAILED", "stage": stage, "detail": result.detail})
 
 
 def main():

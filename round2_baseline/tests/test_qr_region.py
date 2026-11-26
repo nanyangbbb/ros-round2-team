@@ -10,6 +10,7 @@ import route_flow
 polygon=yaml.safe_load((Path(__file__).parents[1]/'config/navigation.yaml').read_text())['local_costmap']['footprint']
 pose=N(position=N(x=.1970214324,y=.2388553431),orientation=N(x=0.,y=0.,z=math.sin(.04125212235/2),w=math.cos(.04125212235/2)))
 c=motion.Control.__new__(motion.Control)
+c.qr_action=None
 c.odom=N(pose=N(pose=pose),twist=N(twist=N(linear=N(x=0.,y=0.),angular=N(z=0.))))
 c.fresh_costmap=lambda deadline:None
 with patch.object(motion.rospy,'get_param',return_value=polygon):
@@ -19,6 +20,10 @@ with patch.object(motion.rospy,'get_param',return_value=polygon):
     c.odom.twist.twist.linear.x=0.
     pose.position.y=.22
     assert not c.qr_ready_to_stop((.2,.25,0.),100.),'Keep the 2cm viewpoint bound'
+    c.qr_action=object()
+    assert c.qr_ready_to_stop((.2,.25,0.),100.),'An in-box stop can use the approach scan'
+    pose.position.y=.21
+    assert not c.qr_ready_to_stop((.2,.25,0.),100.),'Keep the departure alignment bound'
     pose.position.y=.2388553431
     pose.orientation.z=math.sin(.1/2);pose.orientation.w=math.cos(.1/2)
     assert not c.qr_ready_to_stop((.2,.25,0.),100.),'Heading must remain within 0.08rad'

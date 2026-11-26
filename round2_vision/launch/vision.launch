@@ -16,6 +16,12 @@
       - [1.23, 1.0, 0.75, 0.45, 0.0]
       - [-1.23, 1.0, 0.75, 0.45, 0.0]
     </rosparam>
+    <!-- Public fixed placement slots in odom coordinates, in block_poses order. -->
+    <rosparam param="block_targets">
+      - [-1.75, 2.80]
+      - [-2.30, 2.50]
+      - [-1.20, 2.50]
+    </rosparam>
     <rosparam param="stow_pose">[0.0, -0.785, 1.57, 1.57, 0.0]</rosparam>
     <param name="voice" value="cmn"/>
     <param name="voice_rate" value="175"/>

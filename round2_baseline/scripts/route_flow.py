@@ -20,6 +20,17 @@ def via_reached(point,x,y):
     if name=='qr_approach':return x>tx-.05 and y<ty+.20
     return math.hypot(x-tx,y-ty)<.10
 
+def block_arm_clear(pose, goal_x):
+    position = pose.position
+    yaw = yaw_from_orientation(pose.orientation)
+    if abs(position.x - goal_x) >= .12 or abs(yaw - math.pi / 2) >= .65:
+        return False
+    # Bound the stowed-to-center sweep by x=[-.17,.44], y=[-.14,.14] in base_footprint.
+    # Leave clearance beyond the last cone edge (y=1.88) and before the wall (y=2.95).
+    forward = math.sin(yaw)
+    lateral = .14 * abs(math.cos(yaw))
+    return position.y - .17 * forward - lateral >= 1.98 and position.y + .44 * forward + lateral <= 2.90
+
 def entry_curve(start,end,heading):
     x,y=start;tx,ty,target_yaw=end
     handle=.55*min(abs(tx-x),abs(ty-y))
@@ -35,20 +46,43 @@ def entry_curve(start,end,heading):
 
 
 def prepare_fixed_paths(route,tuning,start):
-    from bend_path import PreparedPath,rounded_path
+    from bend_path import PreparedPath,rounded_path,validate_settings
     prefix=[]
     for point in route:
         if point[0].startswith('bend'):prefix.append(point)
         else:break
-    limits=(tuning['max_speed'],tuning['acceleration'],tuning['max_yaw_rate'])
+    limit_keys = ('max_speed','acceleration','max_yaw_rate')
+    limits = tuple(tuning[key] for key in limit_keys)
     plans={'prefix_route':prefix}
     if prefix:
-        points=[tuple(start)]+[(x,2.72 if name in ('bend1','bend2') else y) for name,x,y,_ in prefix]
+        x_offsets = tuning.get('reference_x_offsets', {})
+        y_offsets = tuning.get('reference_y_offsets', {})
+        joined = tuning.get('join_bend5_corners', False) and (
+            {'bend5_approach','bend6'} <= {row[0] for row in prefix})
+        geometry = [row for row in prefix if not (joined and row[0] == 'bend5')]
+        points = [tuple(start)] + [
+            (x + x_offsets.get(name, 0.),
+             (2.72 if name in ('bend1', 'bend2') else y) + y_offsets.get(name, 0.))
+            for name, x, y, _ in geometry
+        ]
         handoff=len(route)>len(prefix) and route[len(prefix)][0]=='qr_approach'
         # This continuation shapes the exit tangent; tracking hands off at bend8 before entering random-cone space.
         if handoff:points.append(tuple(route[len(prefix)][1:3]))
-        plans['prefix']=PreparedPath(rounded_path(points),*limits,end_speed=.2 if handoff else 0.)
+        radii = tuning.get('reference_corner_radii', {})
+        indices = {row[0]: index for index, row in enumerate(geometry, 1)}
+        corner_radii = {indices[name]: radii[name] for name in indices if name in radii}
+        smooth = tuning.get('smooth_corners', {})
+        smooth_corners = {indices[name]: smooth[name] for name in indices if name in smooth}
+        joined_corners = (indices['bend5_approach'], indices['bend6']) if joined else None
+        path = rounded_path(points, radius=tuning.get('corner_radius', .16),
+                            corner_radii=corner_radii, joined_corners=joined_corners,
+                            smooth_corners=smooth_corners)
+        prefix_tuning = dict(tuning, **tuning.get('fixed_prefix_limits', {}))
+        validate_settings(prefix_tuning)
+        prefix_limits = tuple(prefix_tuning[key] for key in limit_keys)
+        plans['prefix'] = PreparedPath(path, *prefix_limits, end_speed=.2 if handoff else 0.)
         plans['handoff_prefix']=handoff
+        plans['prefix_braking_check'] = tuning.get('fixed_prefix_braking_check', True)
     waypoints = {name: (x, y, yaw) for name, x, y, yaw in route}
     if 'qr_exit' in waypoints and 'cone_entry' in waypoints:
         exit_pose = waypoints['qr_exit']
@@ -56,7 +90,7 @@ def prepare_fixed_paths(route,tuning,start):
         plans['entry'] = PreparedPath(curve, *limits, end_speed=.15)
     return plans
 
-def navigate(control,planner,route,deadline,settings,pass_last=False,announce=True):
+def navigate(control,planner,route,deadline,settings,pass_last=False,announce=True,prepare_block=None):
     values=dict(settings,free_goal_vel=pass_last)
     if pass_last and route[-1][0]!='finish_approach':values['yaw_goal_tolerance']=math.pi
     planner.update_configuration(values)
@@ -68,6 +102,7 @@ def navigate(control,planner,route,deadline,settings,pass_last=False,announce=Tr
     if announce:control.report('MOVING',route[0][0])
     control.client.send_goal(goal)
     index=0;last_progress=rospy.get_time();previous=control.odom.pose.pose;approach=False
+    block_arm_extended = False
     while not rospy.is_shutdown():
         if control.manual_supervision:control.fresh_costmap(deadline)
         pose=control.odom.pose.pose;p=pose.position
@@ -83,6 +118,13 @@ def navigate(control,planner,route,deadline,settings,pass_last=False,announce=Tr
         reached_via=via_reached(route[index],p.x,p.y)
         if index<len(route)-1 and reached_via:
             control.report('PASSED',route[index][0]);index+=1;control.report('MOVING',route[index][0])
+        if block_arm_extended and not block_arm_clear(pose, x):
+            raise RuntimeError('Left the block approach corridor with the arm extended')
+        if (prepare_block is not None and index == len(route) - 1
+                and time.monotonic() - control.received < 1 and block_arm_clear(pose, x)):
+            if prepare_block():
+                block_arm_extended = True
+                prepare_block = None
         if name=='qr' and index==len(route)-1 and control.qr_ready_to_stop((x,y,yaw),deadline):
             control.client.cancel_all_goals()
             if not control.stopped():raise RuntimeError('QR region did not stop')
@@ -100,7 +142,7 @@ def navigate(control,planner,route,deadline,settings,pass_last=False,announce=Tr
             control.report('PASSED',name);return
         state=control.client.get_state()
         if state in (2,3,4,5,8,9):
-            if state!=3 and control.manual_supervision:
+            if state!=3 and control.manual_supervision and not block_arm_extended:
                 control.retry_goal(goal);continue
             if state!=3 or index!=len(route)-1 or not control.stopped():raise RuntimeError('Route goal failed: '+name)
             control.report('ARRIVED',name);return
@@ -115,6 +157,7 @@ def follow_fixed_prefix(control, route, plans, deadline):
             prefix, deadline, prepared=plans['prefix'], handoff=handoff,
             position_tolerance=.10 if handoff else .023,
             yaw_tolerance=math.pi if handoff else .12,
+            check_braking=plans.get('prefix_braking_check', True),
         )
     return route[len(prefix):]
 
@@ -154,11 +197,44 @@ def depart_block_area(control, return_waypoint, deadline, align_return):
         raise RuntimeError('Recognition-area departure turn did not stop')
 
 
+def run_qr_blocks_trial(control, route, deadline):
+    """Follow one development reference from the QR box to the block stop."""
+    from bend_path import PreparedPath, rounded_path
+
+    waypoints = {point[0]: point for point in route}
+    _, x, y, yaw = waypoints['qr_exit']
+    entry = waypoints['cone_entry'][1:]
+    blocks = waypoints['blocks']
+    entry_path = entry_curve((x, y), entry, yaw)
+    cone_path = rounded_path(
+        [tuple(entry[:2]), (entry[0], .75), (blocks[1], .75), tuple(blocks[1:3])],
+        spacing=.02, smooth_corners={1: (.17, .20), 2: (.20, .21)})
+    reference = PreparedPath(entry_path[:-1:2] + cone_path, .90, 1.25, 2.2)
+
+    control.report('MOVING', 'qr_exit')
+    control.straight_move(x, y, yaw, deadline, -1, .012)
+    if not control.stopped():
+        raise RuntimeError('QR departure did not stop before changing direction')
+    control.report('ARRIVED', 'qr_exit')
+    control.follow_bends([blocks], deadline, prepared=reference,
+                         position_tolerance=.025, yaw_tolerance=.10)
+    return 'Fixed QR-to-blocks trial stopped at the block waypoint'
+
+
 def run_flow(control, planner, route, deadline):
     settings = rospy.get_param('~flow_settings')
+    if settings.get('qr_blocks_trial', False):
+        return run_qr_blocks_trial(control, route, deadline)
     navigation = settings['navigation']
+    if settings.get('hybrid_full', False):
+        from hybrid_trial import run_full_hybrid
+        return run_full_hybrid(control, route, deadline)
     plans = control.fixed_plans(route)
     route = follow_fixed_prefix(control, route, plans, deadline)
+    if settings.get('debug_bends_only', False):
+        if not control.stopped():
+            raise RuntimeError('Bend trial did not stop after the measurement')
+        return 'Bend trial stopped after bend8'
 
     index = 0
     while index < len(route):
@@ -177,7 +253,9 @@ def run_flow(control, planner, route, deadline):
             continue
 
         if pair == ('cone_exit', 'blocks'):
-            navigate(control, planner, route[index:index + 2], deadline, navigation)
+            prepare = control.prepare_block if settings.get('block_preposition', False) else None
+            navigate(control, planner, route[index:index + 2], deadline, navigation,
+                     prepare_block=prepare)
             control.recognize('block')
             index += 2
             continue

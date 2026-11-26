@@ -11,7 +11,7 @@ import motion_geometry
 
 
 class MotionClockTest(unittest.TestCase):
-    def run_bends(self, *, rate=.12, run_limit=540., moving=True, stale=False, target=2., map_hold=False, manual=False, pause_for=0.):
+    def run_bends(self, *, rate=.12, run_limit=540., moving=True, stale=False, target=2., map_hold=False, manual=False, pause_for=0., route=None, handoff=False, flow=None, braking_clear=True):
         wall=[100.];sim=[1000.];commands=[];events=[];config=[];tracking_positions=[];held=[False]
         c=m.Control.__new__(m.Control)
         c.manual_supervision=manual
@@ -31,7 +31,7 @@ class MotionClockTest(unittest.TestCase):
         c.velocity=NS(publish=lambda msg:commands.append((msg.linear.x,msg.angular.z)))
         tuning=dict(max_speed=1.,acceleration=1.4,max_yaw_rate=2.4,
                     output_speed=1.05,output_acceleration=1.6,output_yaw_rate=2.8)
-        params={'~bend_settings':tuning,'/move_base/local_costmap/footprint':[],
+        params={'~bend_settings':tuning,'~flow_settings':flow or {},'/move_base/local_costmap/footprint':[],
                 '/move_base/local_costmap/footprint_padding':.005}
         client=NS(get_configuration=lambda:{'resolution':.025},update_configuration=config.append)
         def path_command(*args):
@@ -48,18 +48,32 @@ class MotionClockTest(unittest.TestCase):
                 (m.time,'sleep',dict(side_effect=sleep)),
                 (m.rospy,'get_time',dict(side_effect=lambda:sim[0])),
                 (m.rospy,'is_shutdown',dict(return_value=False)),
-                (m.rospy,'get_param',dict(side_effect=lambda key:params[key])),
+                (m.rospy,'get_param',dict(side_effect=lambda key,default=None:params.get(key,default))),
                 (m,'Client',dict(return_value=client)),
                 (bend_path,'path_command',dict(side_effect=path_command)),
-                (bend_path,'braking_clear',dict(return_value=True)),
+                (bend_path,'braking_clear',dict(return_value=braking_clear)),
             ]:stack.enter_context(patch.object(owner,name,**kw))
-            try:c.follow_bends([('bend8',target,0.,0.)],wall[0]+run_limit,
-                               path_override=[(0.,0.,0.),(target,0.,0.)])
+            try:c.follow_bends(route or [('bend8',target,0.,0.)],wall[0]+run_limit,
+                               path_override=[(0.,0.,0.),(target,0.,0.)],handoff=handoff)
             except RuntimeError as exc:error=str(exc)
         self.assertEqual(commands[-1],(0.,0.))
         self.assertEqual(config[-1],{'resolution':.025})
         if map_hold:self.assertAlmostEqual(tracking_positions[0],.3)
         return error,wall[0]-100.,sim[0]-1000.,events
+
+    def test_handoff_requires_all_bend_waypoints(self):
+        route = [('bend7', 1., .3, 0.), ('bend8', 2., 0., 0.)]
+        error, _, _, events = self.run_bends(route=route, handoff=True)
+        self.assertIn('missed a waypoint: bend7', error)
+        self.assertNotIn(('PASSED', 'bend8'), events)
+
+    def test_bend_braking_bypass_requires_bend_only_mode(self):
+        _, _, _, events = self.run_bends(handoff=True, braking_clear=False,
+                                         flow={'debug_no_bend_brake': True})
+        self.assertIn(('ARRIVED', 'bend8'), events)
+        _, _, _, events = self.run_bends(handoff=True, braking_clear=False,
+                                         flow={'debug_bends_only': True, 'debug_no_bend_brake': True})
+        self.assertIn(('PASSED', 'bend8'), events)
 
     def test_bends_refresh_pose_after_map_hold(self):
         error,_,_,_=self.run_bends(map_hold=True)

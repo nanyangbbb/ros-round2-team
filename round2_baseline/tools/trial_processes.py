@@ -57,3 +57,51 @@ def stop_processes(processes):
         try:proc.wait(timeout=1)
         except subprocess.TimeoutExpired:pass
     return dict(owned_processes=len(owned),remaining=survivors())
+
+
+def wait_for_gazebo_window(timeout=20.):
+    """Wait for the Gazebo main window on the trial's X11 display."""
+    import ctypes as c
+
+    x11 = c.CDLL('libX11.so.6')
+    pointer, window = c.c_void_p, c.c_ulong
+    windows = c.POINTER(window)
+    x11.XOpenDisplay.restype = pointer
+    x11.XDefaultRootWindow.argtypes = [pointer]
+    x11.XDefaultRootWindow.restype = window
+    x11.XQueryTree.argtypes = [pointer, window, c.POINTER(window), c.POINTER(window),
+                             c.POINTER(windows), c.POINTER(c.c_uint)]
+    x11.XFetchName.argtypes = [pointer, window, c.POINTER(c.c_char_p)]
+    x11.XFree.argtypes = [pointer]
+    x11.XCloseDisplay.argtypes = [pointer]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError('Cannot connect to the Gazebo GUI display')
+
+    def has_window(parent, depth):
+        name = c.c_char_p()
+        if x11.XFetchName(display, parent, c.byref(name)) and name:
+            try:
+                if name.value == b'Gazebo':
+                    return True
+            finally:
+                x11.XFree(name)
+        if depth:
+            root, owner, children, count = window(), window(), windows(), c.c_uint()
+            if x11.XQueryTree(display, parent, c.byref(root), c.byref(owner), c.byref(children), c.byref(count)):
+                try:
+                    return any(has_window(children[i], depth - 1) for i in range(count.value))
+                finally:
+                    if children:
+                        x11.XFree(children)
+        return False
+
+    try:
+        root = x11.XDefaultRootWindow(display)
+        deadline = time.monotonic() + timeout
+        while not has_window(root, 2):
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Gazebo GUI main window did not appear')
+            time.sleep(.25)
+    finally:
+        x11.XCloseDisplay(display)

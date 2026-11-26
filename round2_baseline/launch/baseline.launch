@@ -6,10 +6,13 @@
   <arg name="timeout_clock" default="wall"/>
   <arg name="manual_supervision" default="false"/>
   <arg name="efficient_approach" default="false"/>
+  <arg name="hybrid_full" default="true"/>
+  <arg name="hybrid_optimize" default="true"/>
   <arg name="map_file" default=""/>
   <arg name="attitude_protection" default="false"/>
   <arg name="vision" default="true"/>
   <arg name="qr_preposition" default="true"/>
+  <arg name="block_preposition" default="false"/>
   <arg name="align_return" default="true"/>
   <arg name="play_audio" default="true"/>
   <arg name="vision_audio_device" default="plughw:1,0"/>
@@ -22,10 +25,13 @@
     <arg name="manual_supervision" value="$(arg manual_supervision)"/>
     <arg name="speed_profile" value="$(arg speed_profile)"/>
     <arg name="efficient_approach" value="$(arg efficient_approach)"/>
+    <arg name="hybrid_full" value="$(arg hybrid_full)"/>
+    <arg name="hybrid_optimize" value="$(arg hybrid_optimize)"/>
     <arg name="map_file" value="$(arg map_file)"/>
     <arg name="attitude_protection" value="$(arg attitude_protection)"/>
     <arg name="vision" value="$(arg vision)"/>
     <arg name="qr_preposition" value="$(arg qr_preposition)"/>
+    <arg name="block_preposition" value="$(arg block_preposition)"/>
     <arg name="align_return" value="$(arg align_return)"/>
     <arg name="play_audio" value="$(arg play_audio)"/>
     <arg name="vision_audio_device" value="$(arg vision_audio_device)"/>
