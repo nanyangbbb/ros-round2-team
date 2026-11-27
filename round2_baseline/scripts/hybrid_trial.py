@@ -376,22 +376,20 @@ def take_green_qr_exit(control, deadline, cancelled, course, qr, evidence):
 
 def plan_finish_path(start, goal, tail, walls, footprint, occupied, cancelled):
     began = time.monotonic()
-    for straight_tail, cone_margin, limit in (
-            (min(tail, RETURN_STRAIGHT_TAIL), RETURN_CONE_MARGIN, 14000), (tail, None, 36000)):
+    short_tail = min(tail, RETURN_STRAIGHT_TAIL)
+    for straight_tail, cone_margin, limit, search in (
+            (short_tail, RETURN_CONE_MARGIN, 14000, 'forward'),
+            (short_tail, RETURN_CONE_MARGIN, 14000, 'guided'),
+            (short_tail, RETURN_CONE_MARGIN, 14000, 'reverse'), (tail, None, 36000, 'forward')):
         course = FootprintMap(walls, footprint, occupied, cone_margin=cone_margin)
+        # A backwards search sees the original asymmetrical footprint rotated through pi.
+        reverse_course = (FootprintMap(walls, [(-x, -y) for x, y in footprint], occupied, cone_margin=cone_margin)
+                          if search == 'reverse' else None)
         try:
-            path, expanded = docking_path(start, goal, straight_tail, course, cancelled, limit=limit)
+            path, expanded = docking_path(start, goal, straight_tail, course, cancelled, limit=limit,
+                                          guide_around_walls=search == 'guided', reverse_map=reverse_course)
         except NoPath:
-            if cone_margin is None:
-                continue
-            # The search travels backwards, so its body-frame outline must rotate half a turn.
-            reverse_course = FootprintMap(walls, [(-x, -y) for x, y in footprint], occupied,
-                                          cone_margin=cone_margin)
-            try:
-                path, expanded = docking_path(start, goal, straight_tail, course, cancelled,
-                                              limit=limit, reverse_map=reverse_course)
-            except NoPath:
-                continue
+            continue
         path = optimize_trajectory(path, course, HYBRID_LIMITS, cancelled, straight_tail=straight_tail)
         return path, expanded, occupied, time.monotonic() - began, cone_margin, straight_tail
     return None

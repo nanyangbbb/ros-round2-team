@@ -155,6 +155,7 @@ def connector(start, goal, max_curvature):
         c = transform(*goal, -scale * distance, 0.)
         d = goal[:2]
         samples = []
+        previous = start
         count = max(5, math.ceil(distance / .012))
         for j in range(1, count + 1):
             t = j / count
@@ -165,7 +166,16 @@ def connector(start, goal, max_curvature):
             speed = math.hypot(dx, dy)
             if speed < 1e-5 or abs(dx*ddy - dy*ddx) > max_curvature * speed**3:
                 break
-            samples.append((x, y, math.atan2(dy, dx)))
+            yaw = math.atan2(dy, dx)
+            # Pointwise derivatives miss a cusp *between* samples. Bound the change
+            # in unit tangent over the chord, including the very first interval.
+            step_x, step_y = x - previous[0], y - previous[1]
+            chord = math.hypot(step_x, step_y)
+            if (step_x * dx + step_y * dy <= 0. or
+                    2 * abs(math.sin((yaw - previous[2]) / 2)) > max_curvature * chord + 1e-9):
+                break
+            previous = (x, y, yaw)
+            samples.append(previous)
         else:
             yield samples
 
@@ -198,8 +208,42 @@ class NoPath(RuntimeError):
     """The forward lattice search exhausted its allowed states."""
 
 
+def course_distance(goal, obstacle_map, cancelled):
+    """Estimate distance around walls on a coarse grid; only the pose search certifies motion."""
+    spacing = .085
+    def cell(pose):
+        return round(pose[0] / spacing), round(pose[1] / spacing)
+
+    target = cell(goal)
+    distances = {target: 0.}
+    blocked = set()
+    queue = [(0., target)]
+    neighbors = [(i, j, spacing * math.hypot(i, j)) for i, j in itertools.product((-1, 0, 1), repeat=2) if i or j]
+    while queue:
+        distance, (x, y) = heapq.heappop(queue)
+        if distance > distances[x, y]:
+            continue
+        if cancelled():
+            raise RuntimeError('Hybrid A* cancelled or timed out')
+        for dx, dy, step in neighbors:
+            key = x + dx, y + dy
+            candidate = distance + step
+            if key in blocked or candidate >= distances.get(key, math.inf):
+                continue
+            if key not in distances and not any(obstacle_map.clear(key[0] * spacing, key[1] * spacing, yaw)
+                                                for yaw in (0., math.pi / 2)):
+                blocked.add(key)
+                continue
+            distances[key] = candidate
+            heapq.heappush(queue, (candidate, key))
+
+    def estimate(pose):
+        return distances.get(cell(pose), math.dist(pose[:2], goal[:2]))
+    return estimate
+
+
 def hybrid_astar(start, goal, obstacle_map, cancelled=lambda: False, *, limit=36000,
-                 viewpoint=None, goal_headings=None, viewpoint_horizon=.66):
+                 viewpoint=None, goal_headings=None, viewpoint_horizon=.66, distance_estimate=None):
     """Search continuous poses with a quantized closed set and forward arc primitives."""
     goals = [goal] if goal_headings is None else [(*goal[:2], yaw) for yaw in goal_headings]
     if viewpoint is None:
@@ -214,7 +258,8 @@ def hybrid_astar(start, goal, obstacle_map, cancelled=lambda: False, *, limit=36
         return round(x / .045), round(y / .045), round(a * 60 / (2 * math.pi)) % 60
 
     def heuristic(pose):
-        return max(math.dist(pose[:2], goal[:2]), min(abs(heading_error(pose[2], target[2])) for target in goals) / 5.8)
+        distance = distance_estimate(pose) if distance_estimate else math.dist(pose[:2], goal[:2])
+        return max(distance, min(abs(heading_error(pose[2], target[2])) for target in goals) / 5.8)
 
     def reconstruct(index):
         parts = []
@@ -268,13 +313,15 @@ def hybrid_astar(start, goal, obstacle_map, cancelled=lambda: False, *, limit=36
 
 
 
-def docking_path(start, goal, straight_tail, obstacle_map, cancelled, *, limit=36000, reverse_map=None):
+def docking_path(start, goal, straight_tail, obstacle_map, cancelled, *, limit=36000, reverse_map=None,
+                 guide_around_walls=False):
     alignment = (*transform(*goal, -straight_tail, 0.), goal[2])
     tail = primitive(alignment, 0., straight_tail, step=.014)
     if not obstacle_map.sweep_clear([alignment, *tail]):
         raise NoPath('Straight docking tail failed the footprint check')
     if reverse_map is None:
-        path, expanded = hybrid_astar(start, alignment, obstacle_map, cancelled, limit=limit)
+        estimate = course_distance(alignment, obstacle_map, cancelled) if guide_around_walls else None
+        path, expanded = hybrid_astar(start, alignment, obstacle_map, cancelled, limit=limit, distance_estimate=estimate)
         return [*path, *tail], expanded
 
     def opposite(pose):
