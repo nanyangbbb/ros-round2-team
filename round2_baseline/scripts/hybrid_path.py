@@ -268,13 +268,23 @@ def hybrid_astar(start, goal, obstacle_map, cancelled=lambda: False, *, limit=36
 
 
 
-def docking_path(start, goal, straight_tail, obstacle_map, cancelled, *, limit=36000):
+def docking_path(start, goal, straight_tail, obstacle_map, cancelled, *, limit=36000, reverse_map=None):
     alignment = (*transform(*goal, -straight_tail, 0.), goal[2])
     tail = primitive(alignment, 0., straight_tail, step=.014)
     if not obstacle_map.sweep_clear([alignment, *tail]):
         raise NoPath('Straight docking tail failed the footprint check')
-    path, expanded = hybrid_astar(start, alignment, obstacle_map, cancelled, limit=limit)
-    return [*path, *tail], expanded
+    if reverse_map is None:
+        path, expanded = hybrid_astar(start, alignment, obstacle_map, cancelled, limit=limit)
+        return [*path, *tail], expanded
+
+    def opposite(pose):
+        return (*pose[:2], math.remainder(pose[2] + math.pi, 2 * math.pi))
+
+    backward, expanded = hybrid_astar(opposite(alignment), opposite(start), reverse_map, cancelled, limit=limit)
+    path = [*(opposite(pose) for pose in reversed(backward)), *tail]
+    if not obstacle_map.sweep_clear(path):
+        raise NoPath('Reversed docking path failed the forward footprint check')
+    return path, expanded
 
 
 def qr_pocket_exit(start, obstacle_map, cancelled):

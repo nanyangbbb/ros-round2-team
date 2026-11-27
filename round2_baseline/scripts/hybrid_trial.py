@@ -290,7 +290,7 @@ def run_hybrid_segment(control, route, deadline, settings, *, full_prefix=None, 
                     remaining = match_layouts(layouts, table.snapshot())
                     if remaining:
                         occupied = frozenset().union(*remaining)
-                        pending = worker.submit(plan_finish_while_recognizing, stopped_pose, finish,
+                        pending = worker.submit(plan_finish_path, stopped_pose, finish,
                                                 math.dist(approach[:2], finish[:2]), walls,
                                                 footprint, occupied, cancelled)
                     parameter = '/round2_vision/block_vehicle_pose'
@@ -374,7 +374,7 @@ def take_green_qr_exit(control, deadline, cancelled, course, qr, evidence):
     return True
 
 
-def plan_finish_while_recognizing(start, goal, tail, walls, footprint, occupied, cancelled):
+def plan_finish_path(start, goal, tail, walls, footprint, occupied, cancelled):
     began = time.monotonic()
     for straight_tail, cone_margin, limit in (
             (min(tail, RETURN_STRAIGHT_TAIL), RETURN_CONE_MARGIN, 14000), (tail, None, 36000)):
@@ -382,7 +382,16 @@ def plan_finish_while_recognizing(start, goal, tail, walls, footprint, occupied,
         try:
             path, expanded = docking_path(start, goal, straight_tail, course, cancelled, limit=limit)
         except NoPath:
-            continue
+            if cone_margin is None:
+                continue
+            # The search travels backwards, so its body-frame outline must rotate half a turn.
+            reverse_course = FootprintMap(walls, [(-x, -y) for x, y in footprint], occupied,
+                                          cone_margin=cone_margin)
+            try:
+                path, expanded = docking_path(start, goal, straight_tail, course, cancelled,
+                                              limit=limit, reverse_map=reverse_course)
+            except NoPath:
+                continue
         path = optimize_trajectory(path, course, HYBRID_LIMITS, cancelled, straight_tail=straight_tail)
         return path, expanded, occupied, time.monotonic() - began, cone_margin, straight_tail
     return None
@@ -406,16 +415,12 @@ def drive_finish(control, deadline, cancelled, table, walls, footprint, layouts,
               and math.dist(start[:2], preplanned[0][0][:2]) < .012
               and abs(heading_error(start[2], preplanned[0][0][2])) < .06
               and course.sweep_clear([start, preplanned[0][0]]))
-    if reused:
-        path, expanded, _, _, cone_margin, tail = preplanned
-    elif optimize:
-        try:
-            path, expanded = docking_path(start, goal, tail, course, cancelled, limit=36000)
-        except NoPath:
-            path = None
+    planned = preplanned if reused else None
+    if planned is None and optimize:
+        planned = plan_finish_path(start, goal, tail, walls, footprint, occupied, cancelled)
+    if planned is not None:
+        path, expanded, _, _, cone_margin, tail = planned
     else:
-        path = None
-    if path is None:
         if optimize:
             # The car can rotate in place, unlike the forward search primitives.
             # Try the smallest checked turns first and require a viable onward route.
@@ -453,8 +458,8 @@ def drive_finish(control, deadline, cancelled, table, walls, footprint, layouts,
         turn_sim_s = rospy.get_time() - turn_began
         plan_started = time.monotonic()
         path, expanded = docking_path(actual_pose(control), goal, tail, course, cancelled, limit=72000)
-    if optimize and not reused:
-        path = optimize_trajectory(path, course, HYBRID_LIMITS, cancelled, straight_tail=tail)
+        if optimize:
+            path = optimize_trajectory(path, course, HYBRID_LIMITS, cancelled, straight_tail=tail)
     evidence['finish_planning'] = dict(path=path, expanded=expanded,
                                        departure_yaw=departure_yaw,
                                        planned_during_recognition=reused,
