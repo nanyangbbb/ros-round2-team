@@ -126,7 +126,7 @@ def rounded_path(points, radius=.16, spacing=.025, corner_radii=None, joined_cor
 class PreparedPath:
     """Cache curvature limits and forward/backward speed reachability along arc length."""
     def __init__(self,path,max_speed,acceleration,max_yaw_rate,end_speed=0.,start_speed=0.,
-                 terminal_heading_distance=0., lookahead_time=0., parking_tolerance=None):
+                 terminal_heading_distance=0., lookahead_time=0., parking_tolerance=None, speed_limit_at=None):
         if len(path)<2 or not all(math.isfinite(v) for p in path for v in p):
             raise ValueError('A prepared path needs at least two finite poses')
         if not all(math.isfinite(v) and v>0 for v in (max_speed,acceleration,max_yaw_rate)) or not (0<=end_speed<=max_speed and 0<=start_speed<=max_speed):
@@ -142,7 +142,8 @@ class PreparedPath:
         if min(self.steps)<=1e-9:raise ValueError('Repeated prepared path positions')
         self.arc=[0.]
         for ds in self.steps:self.arc.append(self.arc[-1]+ds)
-        self.speeds=[max_speed]*len(path)
+        self.speeds=([min(max_speed, speed_limit_at(pose)) for pose in path]
+                     if speed_limit_at is not None else [max_speed]*len(path))
         for i,ds in enumerate(self.steps):
             curvature=abs(math.atan2(math.sin(path[i+1][2]-path[i][2]),math.cos(path[i+1][2]-path[i][2])))/ds
             limit=min(max_speed,math.sqrt(acceleration/max(curvature,1e-9)),max_yaw_rate/max(curvature,1e-9))

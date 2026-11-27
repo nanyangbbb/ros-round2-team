@@ -22,11 +22,11 @@ from hybrid_path import (BLOCK_STOP_RADIUS, BLOCK_WALL_MARGIN, BLUE_EXIT_CONE, C
                          connector, docking_path, heading_error, hybrid_astar, legal_layouts, NoPath, qr_reference,
                          qr_pocket_exit, viewpoint_score)
 from motion_geometry import yaw_from_orientation
-from trajectory_opt import optimize_trajectory
+from trajectory_opt import optimize_trajectory, tangent_stop_speed
 
 HYBRID_LIMITS = (.90, 1.25, 2.2)
 OBSERVATION_LIMITS = (.62, 1.05, 1.8)
-BLOCK_CONE_MARGIN = .030
+BLOCK_CONE_MARGIN = .050
 RETURN_CONE_MARGIN = .035
 RETURN_STRAIGHT_TAIL = .80
 BLOCK_ARM_LINE_Y = 1.75  # Cone-row centerline marked at the block-area entrance.
@@ -602,17 +602,29 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
         plan['start_speed'] = start_speed
         evidence['planning'] = plan
         control.report('PLANNED', f"{len(path)} poses; {plan['remaining_layouts']} compatible layouts")
-        reference = PreparedPath(path, *HYBRID_LIMITS, start_speed=min(.90, start_speed),
+        speed_limit = None
+        if optimize:
+            # Keep room for tracking error when the chassis brakes along its current heading.
+            reserve = min(.015, plan['cone_margin'] / 2)
+            braking_map = FootprintMap(walls, footprint, plan['occupied_union'], margin=.015, cone_margin=reserve)
+
+            def speed_limit(pose):
+                if pose[1] >= BLOCK_ARM_LINE_Y:
+                    return HYBRID_LIMITS[0]
+                # Allow 150 ms for response and budget 1 m/s^2 of the observed 1.6 m/s^2 braking.
+                return tangent_stop_speed(braking_map.clear, pose, HYBRID_LIMITS[0], 1.0, .15)
+
+        reference = PreparedPath(path, *HYBRID_LIMITS, start_speed=min(.90, start_speed), speed_limit_at=speed_limit,
                                  terminal_heading_distance=.10 if terminal_alignment and not free_parking else 0.,
                                  lookahead_time=.22 if free_parking else 0.,
                                  parking_tolerance=BLOCK_STOP_RADIUS if free_parking else None)
         return reference
 
-    def drive_to_blocks(reference, checked, local_velocity=False):
+    def drive_to_blocks(reference, checked):
         control.follow_bends([['blocks', *reference.path[-1]]], deadline, prepared=reference, check_braking=False,
                              position_tolerance=BLOCK_STOP_RADIUS, yaw_tolerance=block_yaw_tolerance,
                              collision_map=checked, align_at_stop=terminal_alignment, local_geometry=local_geometry,
-                             local_velocity=local_velocity, avoidance_active=approach_avoidance_active)
+                             local_velocity=optimize, avoidance_active=approach_avoidance_active)
 
     for _ in range(5):
         initial = candidates()
@@ -755,6 +767,6 @@ def drive_blocks(control, deadline, cancelled, table, walls, footprint, layouts,
                 stop_workers.set()
         if selection is not None:
             _, _, _, _, block_reference, checked, _ = selection
-            drive_to_blocks(block_reference, checked, local_velocity=optimize)
+            drive_to_blocks(block_reference, checked)
             return
     raise RuntimeError('No common block route after five checked observation segments')

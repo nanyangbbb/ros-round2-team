@@ -86,6 +86,21 @@ def optimize_trajectory(path, obstacle_map, limits, cancelled, *, start_speed=0.
     return path
 
 
+def tangent_stop_speed(clear, pose, max_speed, deceleration, latency):
+    """Limit speed so a straight braking sweep fits after command latency."""
+    x, y, yaw = pose
+    horizon = max_speed * latency + max_speed ** 2 / (2 * deceleration)
+    steps = math.ceil(horizon / .01)
+    dx = math.cos(yaw) * horizon / steps
+    dy = math.sin(yaw) * horizon / steps
+    for i in range(1, steps + 1):
+        if not clear(x + i * dx, y + i * dy, yaw):
+            available = (i - 1) * horizon / steps
+            offset = deceleration * latency
+            return math.sqrt(offset ** 2 + 2 * deceleration * available) - offset
+    return max_speed
+
+
 def local_speed(clear, position, measured, command, acceleration):
     """Pick the fastest sampled command whose current and next braking sweeps fit."""
     vx, omega = command
